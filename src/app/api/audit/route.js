@@ -1,3 +1,4 @@
+
 import { NextResponse } from "next/server";
 import * as cheerio from "cheerio";
 import { lookup } from "node:dns/promises";
@@ -7,7 +8,7 @@ const TIMEOUT_MS = 10000;
 const MAX_HTML_SIZE = 2_000_000;
 const MAX_LINKS_TO_CHECK = 20;
 const LINK_TIMEOUT_MS = 4000;
-const USER_AGENT = "NexRankSEOAudit/0.4";
+const USER_AGENT = "NexRankSEOAudit/0.5";
 
 function isPrivateIPv4(ip) {
   const p = ip.split(".").map(Number);
@@ -71,9 +72,7 @@ function validateUrl(value, baseUrl) {
   }
 
   if (url.username || url.password) {
-    throw new Error(
-      "URLs containing usernames or passwords are not allowed."
-    );
+    throw new Error("URLs containing usernames or passwords are not allowed.");
   }
 
   if (url.port && !["80", "443"].includes(url.port)) {
@@ -144,6 +143,7 @@ async function fetchWithTimeout(url, options = {}, timeout = TIMEOUT_MS) {
     return await fetch(url, {
       ...options,
       signal: controller.signal,
+      cache: "no-store",
     });
   } finally {
     clearTimeout(timer);
@@ -211,7 +211,6 @@ async function fetchWebsite(url) {
 async function checkSingleLink(linkUrl) {
   try {
     const url = validateUrl(linkUrl);
-
     await validatePublicHost(url);
 
     const response = await fetchWithTimeout(
@@ -251,6 +250,8 @@ async function checkSingleLink(linkUrl) {
       unknown: "Could not confirm link status",
     };
 
+    await response.body?.cancel().catch(() => {});
+
     return {
       url: url.href,
       status,
@@ -271,12 +272,15 @@ async function checkSingleLink(linkUrl) {
 }
 
 async function checkLinks(linkUrls) {
-  const unique = [...new Set(linkUrls)].slice(0, MAX_LINKS_TO_CHECK);
+  const uniqueUrls = [...new Set(linkUrls)]
+    .filter(Boolean)
+    .slice(0, MAX_LINKS_TO_CHECK);
+
   const results = [];
 
-  for (let i = 0; i < unique.length; i += 4) {
+  for (let i = 0; i < uniqueUrls.length; i += 4) {
     const batch = await Promise.all(
-      unique.slice(i, i + 4).map(checkSingleLink)
+      uniqueUrls.slice(i, i + 4).map(checkSingleLink)
     );
 
     results.push(...batch);
@@ -286,18 +290,19 @@ async function checkLinks(linkUrls) {
     checked: results.length,
     working: results.filter((item) => item.state === "working").length,
     broken: results.filter((item) => item.state === "broken").length,
-    serverErrors: results.filter((item) => item.state === "server_error")
-      .length,
+    serverErrors: results.filter((item) => item.state === "server_error").length,
     redirects: results.filter((item) => item.state === "redirect").length,
-    unknown: results.filter((item) => item.state === "unknown").length,
+    unknown: results.filter(
+      (item) => item.state === "unknown" || item.state === "redirect"
+    ).length,
     results,
   };
 }
 
 async function fetchTextResource(url) {
-  await validatePublicHost(url);
-
   try {
+    await validatePublicHost(url);
+
     const response = await fetchWithTimeout(
       url.href,
       {
@@ -311,19 +316,19 @@ async function fetchTextResource(url) {
     );
 
     if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => {});
       return {
         ok: false,
         status: response.status,
-        redirected: true,
         text: "",
       };
     }
 
     if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
       return {
         ok: false,
         status: response.status,
-        redirected: false,
         text: "",
       };
     }
@@ -333,14 +338,12 @@ async function fetchTextResource(url) {
     return {
       ok: true,
       status: response.status,
-      redirected: false,
       text: text.slice(0, 500_000),
     };
   } catch {
     return {
       ok: false,
       status: null,
-      redirected: false,
       text: "",
     };
   }
@@ -357,7 +360,6 @@ async function checkRobotsAndSitemap(pageUrl) {
   ]);
 
   const robotsExists = robots.ok;
-
   const sitemapExists =
     sitemap.ok && /<urlset\b|<sitemapindex\b/i.test(sitemap.text);
 
@@ -375,10 +377,8 @@ async function checkRobotsAndSitemap(pageUrl) {
       status: robots.status,
       mentionsSitemap: robotsMentionsSitemap,
       disallowAll:
-        robotsExists &&
-        /^\s*Disallow\s*:\s*\/\s*$/im.test(robots.text),
+        robotsExists && /^\s*Disallow\s*:\s*\/\s*$/im.test(robots.text),
     },
-
     sitemap: {
       url: sitemapUrl.href,
       exists: sitemapExists,
@@ -432,7 +432,7 @@ function categoryFor(name) {
     return "Content";
   }
 
-  if (/HTTP|viewport|robots\.txt|sitemap|canonical count|indexing/i.test(name)) {
+  if (/HTTP|viewport|robots\.txt|sitemap|indexing/i.test(name)) {
     return "Technical SEO";
   }
 
@@ -443,6 +443,7 @@ function addCheck(checks, name, passed, points, detail, category) {
   checks.push({
     name,
     passed,
+    status: passed ? "pass" : "review",
     points,
     detail,
     category: category || categoryFor(name),
@@ -465,7 +466,17 @@ async function buildAudit(html, pageUrl, status, contentType) {
   ).toLowerCase();
 
   const canonicalTags = $('link[rel~="canonical"]');
-  const canonical = canonicalTags.first().attr("href") || "";
+  const rawCanonical = canonicalTags.first().attr("href") || "";
+
+  let canonical = "";
+
+  if (rawCanonical) {
+    try {
+      canonical = new URL(rawCanonical, pageUrl).href;
+    } catch {
+      canonical = rawCanonical;
+    }
+  }
 
   const h1s = $("h1")
     .map((_, el) => $(el).text().trim())
@@ -473,6 +484,11 @@ async function buildAudit(html, pageUrl, status, contentType) {
     .filter(Boolean);
 
   const h2s = $("h2")
+    .map((_, el) => $(el).text().trim())
+    .get()
+    .filter(Boolean);
+
+  const h3s = $("h3")
     .map((_, el) => $(el).text().trim())
     .get()
     .filter(Boolean);
@@ -503,9 +519,10 @@ async function buildAudit(html, pageUrl, status, contentType) {
 
   const allLinks = $("a[href]")
     .map((_, el) => ({
-      href: $(el).attr("href"),
+      href: $(el).attr("href") || "",
       text: $(el).text().trim(),
       aria: ($(el).attr("aria-label") || "").trim(),
+      hasImage: $(el).find("img").length > 0,
     }))
     .get();
 
@@ -530,19 +547,14 @@ async function buildAudit(html, pageUrl, status, contentType) {
         externalLinks++;
       }
 
-      if (
-        !link.text &&
-        !link.aria &&
-        !$("a[href]")
-          .filter((_, el) => $(el).attr("href") === link.href)
-          .find("img").length
-      ) {
+      if (!link.text && !link.aria && !link.hasImage) {
         emptyTextLinks++;
       }
 
       if (
-        linksToCheck.length < MAX_LINKS_TO_CHECK &&
-        !link.href.startsWith("#")
+        !parsed.hash &&
+        !linksToCheck.includes(parsed.href) &&
+        linksToCheck.length < MAX_LINKS_TO_CHECK
       ) {
         linksToCheck.push(parsed.href);
       }
@@ -552,7 +564,6 @@ async function buildAudit(html, pageUrl, status, contentType) {
   }
 
   const jsonLdScripts = $('script[type="application/ld+json"]');
-
   let schemaValid = true;
   const schemaErrors = [];
 
@@ -567,8 +578,10 @@ async function buildAudit(html, pageUrl, status, contentType) {
     }
   });
 
-  const resourceChecks = await checkRobotsAndSitemap(pageUrl);
-  const linkAudit = await checkLinks(linksToCheck);
+  const [resourceChecks, linkAudit] = await Promise.all([
+    checkRobotsAndSitemap(pageUrl),
+    checkLinks(linksToCheck),
+  ]);
 
   const checks = [];
 
@@ -604,9 +617,7 @@ async function buildAudit(html, pageUrl, status, contentType) {
     "Page has a meta description",
     Boolean(description),
     10,
-    description
-      ? "Meta description found"
-      : "No meta description found",
+    description || "No meta description found",
     "Metadata"
   );
 
@@ -749,8 +760,8 @@ async function buildAudit(html, pageUrl, status, contentType) {
     resourceChecks.sitemap.exists,
     3,
     resourceChecks.sitemap.exists
-      ? `Found sitemap with ${resourceChecks.sitemap.urlCount} <loc> entry/entries`
-      : "sitemap.xml not found or not recognized as XML sitemap",
+      ? `Found sitemap with ${resourceChecks.sitemap.urlCount} <loc> entries`
+      : "sitemap.xml not found or not recognized as an XML sitemap",
     "Technical SEO"
   );
 
@@ -825,14 +836,30 @@ async function buildAudit(html, pageUrl, status, contentType) {
     contentType,
     score,
     scoreBreakdown,
+
     title,
     titleLength: title.length,
+    titleCount,
     titleTagCount: titleCount,
+
     description,
     descriptionLength: description.length,
+    descriptionCount: $("meta[name='description']").length,
+
+    canonical,
+    canonicalCount: canonicalTags.length,
+    robots,
+
     h1s,
     h2s,
+    h3s,
     headingCount: headingLevels.length,
+
+    headings: {
+      h1: h1s.length,
+      h2: h2s.length,
+      h3: h3s.length,
+    },
 
     images: {
       total: images.length,
@@ -841,21 +868,31 @@ async function buildAudit(html, pageUrl, status, contentType) {
     },
 
     links: {
+      total: allLinks.length,
       internal: internalLinks,
       external: externalLinks,
       invalid: invalidLinks,
       emptyText: emptyTextLinks,
       checked: linkAudit.checked,
+      checkLimit: MAX_LINKS_TO_CHECK,
+      working: linkAudit.working,
       broken: linkAudit.broken,
       serverErrors: linkAudit.serverErrors,
       redirects: linkAudit.redirects,
       unknown: linkAudit.unknown,
-      brokenLinkDetails: linkAudit.results.filter(
-        (item) => item.state !== "working"
-      ),
+
+      // Include all checked URLs so the UI filters can show every status.
+      brokenLinkDetails: linkAudit.results.map((item) => ({
+        url: item.url,
+        status:
+          item.state === "redirect" ? "unknown" : item.state,
+        httpStatus: item.status,
+        detail: item.message,
+      })),
     },
 
-    robots: resourceChecks.robots,
+    robotsFile: resourceChecks.robots,
+    robotsInfo: resourceChecks.robots,
     sitemap: resourceChecks.sitemap,
 
     structuredData: {
@@ -884,7 +921,7 @@ async function buildAudit(html, pageUrl, status, contentType) {
     },
 
     note:
-      "NexRank Starter SEO Audit checks common on-page and technical signals. It is not a Google ranking prediction. Structured data validation checks JSON syntax, not Google's full rich-result eligibility rules. Link checks are limited to a sample and some servers block HEAD requests.",
+      "NexRank Starter SEO Audit checks common on-page and technical signals. It is not a Google ranking prediction. Structured data validation checks JSON syntax, not Google's full rich-result eligibility rules. Link checks are limited to a sample of up to 20 unique links. Some servers block HEAD requests, so some statuses may be unknown.",
   };
 }
 
@@ -900,7 +937,6 @@ export async function POST(request) {
     }
 
     const url = validateUrl(body.url.trim());
-
     const { html, status, contentType } = await fetchWebsite(url);
 
     const result = await buildAudit(
@@ -915,16 +951,14 @@ export async function POST(request) {
     const message =
       error?.message || "Audit failed. Please try again.";
 
-    const status =
+    const clientError =
       /please enter|only HTTP|not allowed|private|internal|custom ports|public website|valid website/i.test(
         message
-      )
-        ? 400
-        : 422;
+      );
 
     return NextResponse.json(
       { error: message },
-      { status }
+      { status: clientError ? 400 : 422 }
     );
   }
 }
