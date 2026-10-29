@@ -1,7 +1,10 @@
 
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+
+const HISTORY_KEY = "nexrank-audit-history";
+const MAX_HISTORY = 10;
 
 const recommendationTips = {
   "HTML response":
@@ -57,10 +60,43 @@ function getLinkStatusLabel(status) {
 
 function getLinkStatusColor(status) {
   if (status === "working") return [30, 125, 85];
+
   if (status === "broken" || status === "server_error") {
     return [185, 55, 55];
   }
+
   return [185, 105, 25];
+}
+
+function formatAuditDate(date) {
+  try {
+    return new Date(date).toLocaleString("en-IN");
+  } catch {
+    return "Date unavailable";
+  }
+}
+
+function readAuditHistory() {
+  try {
+    const saved = window.localStorage.getItem(HISTORY_KEY);
+
+    if (!saved) return [];
+
+    const parsed = JSON.parse(saved);
+
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.filter(
+      (item) =>
+        item &&
+        item.id &&
+        item.audit &&
+        typeof item.audit === "object"
+    );
+  } catch (error) {
+    console.warn("Could not load audit history:", error);
+    return [];
+  }
 }
 
 export default function Home() {
@@ -70,6 +106,69 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [pdfLoading, setPdfLoading] = useState(false);
   const [linkFilter, setLinkFilter] = useState("all");
+  const [history, setHistory] = useState([]);
+
+  useEffect(() => {
+    setHistory(readAuditHistory());
+  }, []);
+
+  function saveAuditToHistory(auditData) {
+    const item = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      auditedAt: new Date().toISOString(),
+      url: auditData.url,
+      score: auditData.score,
+      title: auditData.title || "",
+      httpStatus: auditData.httpStatus,
+      audit: auditData,
+    };
+
+    try {
+      const existing = readAuditHistory();
+      const updated = [item, ...existing].slice(0, MAX_HISTORY);
+
+      window.localStorage.setItem(HISTORY_KEY, JSON.stringify(updated));
+      setHistory(updated);
+    } catch (error) {
+      console.warn("Could not save audit history:", error);
+
+      setError(
+        "Audit completed, but browser storage could not save the history. You can still view the current audit."
+      );
+    }
+  }
+
+  function openHistoryItem(item) {
+    if (!item?.audit) return;
+
+    setAudit(item.audit);
+    setUrl(item.url || item.audit.url || "");
+    setError("");
+    setLinkFilter("all");
+
+    window.setTimeout(() => {
+      document.getElementById("audit-results")?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 100);
+  }
+
+  function clearAuditHistory() {
+    const confirmed = window.confirm(
+      "Clear all saved SEO audit history from this browser?"
+    );
+
+    if (!confirmed) return;
+
+    try {
+      window.localStorage.removeItem(HISTORY_KEY);
+      setHistory([]);
+    } catch (error) {
+      console.warn("Could not clear audit history:", error);
+      setError("Could not clear saved history. Please try again.");
+    }
+  }
 
   async function handleAudit(event) {
     event.preventDefault();
@@ -98,8 +197,9 @@ export default function Home() {
       }
 
       setAudit(data);
+      saveAuditToHistory(data);
 
-      setTimeout(() => {
+      window.setTimeout(() => {
         document.getElementById("audit-results")?.scrollIntoView({
           behavior: "smooth",
           block: "start",
@@ -136,7 +236,7 @@ export default function Home() {
       let y = 53;
       let logoDataUrl = null;
 
-      // Load NexRank logo
+      // Load NexRank logo.
       try {
         const logoResponse = await fetch("/nexrank-logo.png", {
           cache: "no-store",
@@ -304,7 +404,7 @@ export default function Home() {
         y += requiredHeight;
       }
 
-      // First page header
+      // First page header.
       drawHeader(true);
 
       addText("Website overview", {
@@ -357,7 +457,7 @@ export default function Home() {
         `Links: ${audit.links.total} total, ${audit.links.internal} internal, ${audit.links.external ?? 0} external`
       );
 
-      // Broken link report in PDF
+      // Broken link report.
       const linkDetails = audit.links.brokenLinkDetails || [];
 
       addText("Broken link checker", {
@@ -654,6 +754,65 @@ export default function Home() {
         </div>
       </section>
 
+      {/* SEO AUDIT HISTORY */}
+      {history.length > 0 && (
+        <section className="features" id="audit-history">
+          <div className="section-heading">
+            <span>SAVED REPORTS</span>
+            <h2>SEO audit history</h2>
+            <p>
+              Your 10 most recent audits saved in this browser.
+              Clearing this browser's site data may remove the history.
+            </p>
+          </div>
+
+          <div className="feature-grid">
+            {history.map((item) => (
+              <article className="feature-card" key={item.id}>
+                <div className="feature-icon">↺</div>
+
+                <h3 style={{ overflowWrap: "anywhere" }}>
+                  {item.title || item.url}
+                </h3>
+
+                <p style={{ overflowWrap: "anywhere" }}>{item.url}</p>
+
+                <p>
+                  <strong>SEO score:</strong> {item.score}/100
+                </p>
+
+                <p>
+                  <strong>HTTP status:</strong> {item.httpStatus ?? "Unknown"}
+                </p>
+
+                <p>
+                  <strong>Audited:</strong>{" "}
+                  {formatAuditDate(item.auditedAt)}
+                </p>
+
+                <button
+                  type="button"
+                  className="nav-button"
+                  onClick={() => openHistoryItem(item)}
+                >
+                  View report
+                </button>
+              </article>
+            ))}
+          </div>
+
+          <div className="pdf-download">
+            <button
+              type="button"
+              className="nav-button"
+              onClick={clearAuditHistory}
+            >
+              Clear history
+            </button>
+          </div>
+        </section>
+      )}
+
       {audit && (
         <section className="features" id="audit-results">
           <div className="section-heading">
@@ -688,7 +847,7 @@ export default function Home() {
             </article>
           </div>
 
-          {/* Broken link checker results */}
+          {/* BROKEN LINK CHECKER */}
           <div className="recommendations">
             <div className="section-heading">
               <span>LINK HEALTH</span>
@@ -799,9 +958,7 @@ export default function Home() {
             ) : (
               <article className="feature-card">
                 <h3>No link details available</h3>
-                <p>
-                  Run a new audit to check links on this page.
-                </p>
+                <p>Run a new audit to check links on this page.</p>
               </article>
             )}
           </div>
@@ -824,8 +981,8 @@ export default function Home() {
               <span>YOUR ACTION PLAN</span>
               <h2>Recommended next steps</h2>
               <p>
-                Review the flagged checks and prioritize the
-                improvements relevant to your website.
+                Review the flagged checks and prioritize the improvements
+                relevant to your website.
               </p>
             </div>
 
@@ -839,13 +996,16 @@ export default function Home() {
                     <div className="feature-icon">!</div>
                     <h3>{check.name}</h3>
                     <p>{check.detail}</p>
+
                     <p>
                       <strong>What to do</strong>
                     </p>
+
                     <p>
                       {recommendationTips[check.name] ||
                         "Review this finding and investigate the reported issue."}
                     </p>
+
                     <span className="neutral-pill">Needs review</span>
                   </article>
                 ))}
@@ -855,9 +1015,9 @@ export default function Home() {
                 <div className="feature-icon">✓</div>
                 <h3>No flagged issues</h3>
                 <p>
-                  All checks in this starter audit passed. Continue
-                  monitoring your website and review other SEO factors
-                  that this audit does not cover.
+                  All checks in this starter audit passed. Continue monitoring
+                  your website and review other SEO factors that this audit
+                  does not cover.
                 </p>
               </article>
             )}
@@ -879,8 +1039,8 @@ export default function Home() {
             <div className="feature-icon">◎</div>
             <h3>SEO health checks</h3>
             <p>
-              Identify missing metadata, heading issues, and other
-              on-page SEO signals.
+              Identify missing metadata, heading issues, and other on-page SEO
+              signals.
             </p>
           </article>
 
