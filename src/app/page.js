@@ -76,6 +76,54 @@ function formatAuditDate(date) {
   }
 }
 
+function normalizeAuditUrl(value) {
+  try {
+    const parsed = new URL(value);
+    const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return `${parsed.origin}${pathname}`.toLowerCase();
+  } catch {
+    return String(value || "").trim().toLowerCase().replace(/\/+$/, "");
+  }
+}
+
+function buildScoreComparisons(items) {
+  const grouped = new Map();
+
+  for (const item of items) {
+    const key = normalizeAuditUrl(item.url || item.audit?.url);
+
+    if (!key || !Number.isFinite(Number(item.score))) continue;
+
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+
+    grouped.get(key).push(item);
+  }
+
+  return Array.from(grouped.entries())
+    .filter(([, audits]) => audits.length >= 2)
+    .map(([key, audits]) => {
+      const latest = audits[0];
+      const previous = audits[1];
+      const difference = Number(latest.score) - Number(previous.score);
+
+      return {
+        key,
+        url: latest.url || latest.audit?.url || key,
+        latest,
+        previous,
+        difference,
+        status:
+          difference > 0
+            ? "Improved"
+            : difference < 0
+              ? "Decreased"
+              : "Unchanged",
+      };
+    });
+}
+
 function readAuditHistory() {
   try {
     const saved = window.localStorage.getItem(HISTORY_KEY);
@@ -590,6 +638,8 @@ export default function Home() {
     (link) => linkFilter === "all" || link.status === linkFilter
   );
 
+  const scoreComparisons = buildScoreComparisons(history);
+
   return (
     <main className="site">
       <nav className="navbar">
@@ -754,7 +804,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* SEO AUDIT HISTORY */}
+      {/* SEO AUDIT HISTORY AND SCORE COMPARISON */}
       {history.length > 0 && (
         <section className="features" id="audit-history">
           <div className="section-heading">
@@ -765,6 +815,87 @@ export default function Home() {
               Clearing this browser's site data may remove the history.
             </p>
           </div>
+
+          {scoreComparisons.length > 0 && (
+            <div className="recommendations" style={{ marginBottom: "24px" }}>
+              <div className="section-heading">
+                <span>SEO PROGRESS</span>
+                <h2>Score comparison</h2>
+                <p>
+                  Compare the two most recent saved audits for each website.
+                  This tracks NexRank audit scores, not Google rankings.
+                </p>
+              </div>
+
+              <div className="feature-grid">
+                {scoreComparisons.map((comparison) => {
+                  const improved = comparison.difference > 0;
+                  const decreased = comparison.difference < 0;
+
+                  const changeColor = improved
+                    ? "#16845b"
+                    : decreased
+                      ? "#c24141"
+                      : "#64748b";
+
+                  const changeText =
+                    comparison.difference > 0
+                      ? `+${comparison.difference} points`
+                      : comparison.difference < 0
+                        ? `${comparison.difference} points`
+                        : "No change";
+
+                  return (
+                    <article className="feature-card" key={comparison.key}>
+                      <div className="feature-icon">↗</div>
+
+                      <h3 style={{ overflowWrap: "anywhere" }}>
+                        {comparison.url}
+                      </h3>
+
+                      <p>
+                        <strong>Previous score:</strong>{" "}
+                        {comparison.previous.score}/100
+                      </p>
+
+                      <p>
+                        <strong>Latest score:</strong>{" "}
+                        {comparison.latest.score}/100
+                      </p>
+
+                      <p>
+                        <strong>Score change:</strong>{" "}
+                        <span style={{ color: changeColor, fontWeight: 700 }}>
+                          {changeText}
+                        </span>
+                      </p>
+
+                      <span
+                        className="neutral-pill"
+                        style={{ color: changeColor }}
+                      >
+                        {comparison.status}
+                      </span>
+
+                      <p>
+                        <small>
+                          Previous:{" "}
+                          {formatAuditDate(comparison.previous.auditedAt)}
+                        </small>
+                      </p>
+
+                      <p>
+                        <small>
+                          Latest:{" "}
+                          {formatAuditDate(comparison.latest.auditedAt)}
+                        </small>
+                      </p>
+                    </article>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           <div className="feature-grid">
             {history.map((item) => (
@@ -839,7 +970,7 @@ export default function Home() {
             <article className="feature-card">
               <div className="feature-icon">H</div>
               <h3>Headings and images</h3>
-              <p>H1 headings: {audit.headings.h1}</p>
+              <p>H1 headings: {audit.headings?.h1 ?? 0}</p>
               <p>
                 Images missing alt text: {audit.images.missingAlt} of{" "}
                 {audit.images.total}
